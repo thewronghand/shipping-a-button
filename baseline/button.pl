@@ -1,0 +1,552 @@
+#!/usr/bin/perl
+# shipping-a-button — Chapter 0: the baseline.
+#
+# "One Perl script and a cron job." No containers, no YAML, no dependencies
+# beyond core Perl. Everything the dashboard needs lives in this file:
+#
+#   perl button.pl generate [--seed N]  synthetic Acme Payments data -> data/
+#   perl button.pl build                pages, statements, API, counter -> out/
+#   perl button.pl serve [--port N]     static HTTP server over out/, logs to logs/
+#   perl button.pl golden               write the canonical figures -> ../golden/
+#   perl button.pl verify               check out/ against ../golden/
+#
+# The cron job runs `build` every minute. The button counter (FR-4) is derived
+# from the server's access log with a regular expression, as is traditional.
+#
+# This file is FROZEN after Chapter 0 (README P-4).
+
+use strict;
+use warnings;
+use FindBin qw($Bin);
+use File::Path qw(make_path);
+use File::Spec;
+use Time::Local qw(timegm);
+use POSIX qw(strftime);
+use IO::Socket::INET;
+use JSON::PP;
+use Digest::SHA qw(sha256_hex);
+
+my $DATA   = "$Bin/data";
+my $OUT    = "$Bin/out";
+my $LOGS   = "$Bin/logs";
+my $GOLDEN = "$Bin/../golden";
+
+my $DEFAULT_SEED = 20261012;
+my $FIRST_DAY    = '2026-07-01';
+my $LAST_DAY     = '2026-09-30';
+my $SETTLEMENT_LAG_DAYS = 2;
+
+my $JSON = JSON::PP->new->canonical(1)->pretty(1);
+
+my %COMMANDS = (
+    generate => \&cmd_generate,
+    build    => \&cmd_build,
+    serve    => \&cmd_serve,
+    golden   => \&cmd_golden,
+    verify   => \&cmd_verify,
+);
+
+
+# ---------------------------------------------------------------------------
+# Deterministic randomness
+#
+# Park–Miller "minimal standard" generator. Perl's own rand() is not guaranteed
+# to match across builds, and every later chapter must reproduce these figures
+# exactly. All intermediate values stay below 2^47, so 64-bit integers suffice.
+# ---------------------------------------------------------------------------
+
+my $rng_state;
+
+sub seed_rng {
+    my ($seed) = @_;
+    $rng_state = $seed % 2147483647;
+    $rng_state = 1 if $rng_state <= 0;
+}
+
+sub next_rng {
+    $rng_state = ($rng_state * 48271) % 2147483647;
+    return $rng_state;
+}
+
+sub rand_int {    # inclusive
+    my ($lo, $hi) = @_;
+    return $lo + next_rng() % ($hi - $lo + 1);
+}
+
+sub rand_pick {
+    my ($list) = @_;
+    return $list->[ rand_int(0, $#$list) ];
+}
+
+# ---------------------------------------------------------------------------
+# generate
+# ---------------------------------------------------------------------------
+
+my @PLACE = qw(Harbor Maple Granite Willow Copper Juniper Linden Saffron Cobalt Meadow Ember Hollow);
+my @TRADE = ('Coffee', 'Bakery', 'Books', 'Florist', 'Hardware', 'Noodle Bar',
+             'Bicycles', 'Records', 'Tailor', 'Pharmacy', 'Stationery', 'Grocer');
+
+sub cmd_generate {
+    my (%opt) = @_;
+    my $seed = $opt{seed} // $DEFAULT_SEED;
+    seed_rng($seed);
+    make_path($DATA);
+
+    # Hierarchy: 3 distributors x 2 agencies x 3 merchants = 18 merchants.
+    my @merchants;
+    my %used_name;
+    for my $d (1 .. 3) {
+        my $dist_id   = sprintf 'D%02d', $d;
+        my $dist_name = rand_pick(\@PLACE) . ' Distribution';
+        for my $a (1 .. 2) {
+            my $agency_id   = sprintf 'A%02d', ($d - 1) * 2 + $a;
+            my $agency_name = rand_pick(\@PLACE) . ' Agency';
+            for (1 .. 3) {
+                my $name;
+                do { $name = rand_pick(\@PLACE) . ' ' . rand_pick(\@TRADE) } while $used_name{$name}++;
+                push @merchants, {
+                    merchant_id      => sprintf('M%03d', scalar(@merchants) + 1),
+                    merchant_name    => $name,
+                    agency_id        => $agency_id,
+                    agency_name      => $agency_name,
+                    distributor_id   => $dist_id,
+                    distributor_name => $dist_name,
+                    fee_bp           => 150 + 5 * rand_int(0, 40),    # 1.50% .. 3.50%
+                };
+            }
+        }
+    }
+
+    my @mcols = qw(merchant_id merchant_name agency_id agency_name distributor_id distributor_name fee_bp);
+    write_csv("$DATA/merchants.csv", \@mcols, [ map { my $m = $_; [ map { $m->{$_} } @mcols ] } @merchants ]);
+
+    my @tcols = qw(tx_id merchant_id date time method status amount);
+    my @rows;
+    my $seq = 0;
+    for my $date (date_range($FIRST_DAY, $LAST_DAY)) {
+        for my $m (@merchants) {
+            my $n = rand_int(20, 120);
+            for (1 .. $n) {
+                my $roll   = rand_int(1, 100);
+                my $method = $roll <= 70 ? 'card' : $roll <= 85 ? 'transfer' : 'easypay';
+                my $status = rand_int(1, 100) <= 3 ? 'cancelled' : 'approved';
+                my $amount = rand_int(10, 5000) * 100;    # KRW 1,000 .. 500,000
+                my $time   = sprintf '%02d:%02d:%02d', rand_int(0, 23), rand_int(0, 59), rand_int(0, 59);
+                push @rows, [ sprintf('T%07d', ++$seq), $m->{merchant_id}, $date, $time, $method, $status, $amount ];
+            }
+        }
+    }
+    write_csv("$DATA/transactions.csv", \@tcols, \@rows);
+
+    printf "generated %d merchants, %d transactions (seed %d)\n", scalar @merchants, scalar @rows, $seed;
+}
+
+# ---------------------------------------------------------------------------
+# Figures
+#
+# Rules (shared by every chapter):
+#   - only approved transactions count; cancelled ones are ignored entirely
+#   - fee per transaction = floor(amount * fee_bp / 10000)   (KRW, sub-won truncated)
+#   - daily fee = sum of per-transaction fees (never a fee on the daily total)
+#   - payout = amount - fee
+#   - settlement date = transaction date + 2 calendar days
+#   - a period is a calendar month
+# ---------------------------------------------------------------------------
+
+sub load_figures {
+    my $merchants = read_csv("$DATA/merchants.csv");
+    my %by_id = map { $_->{merchant_id} => $_ } @$merchants;
+
+    my %daily;    # merchant_id -> date -> {transactions, amount, fee}
+    my $txs = read_csv("$DATA/transactions.csv");
+    for my $t (@$txs) {
+        next unless $t->{status} eq 'approved';
+        my $m   = $by_id{ $t->{merchant_id} } or die "unknown merchant $t->{merchant_id}\n";
+        my $fee = int($t->{amount} * $m->{fee_bp} / 10000);
+        my $day = $daily{ $t->{merchant_id} }{ $t->{date} } //= { transactions => 0, amount => 0, fee => 0 };
+        $day->{transactions}++;
+        $day->{amount} += $t->{amount};
+        $day->{fee}    += $fee;
+    }
+
+    my %periods;
+    for my $mid (keys %daily) {
+        for my $date (keys %{ $daily{$mid} }) {
+            my $day = $daily{$mid}{$date};
+            $day->{date}            = $date;
+            $day->{settlement_date} = add_days($date, $SETTLEMENT_LAG_DAYS);
+            $day->{payout}          = $day->{amount} - $day->{fee};
+            my ($period) = $date =~ /^(\d{4}-\d{2})/;
+            push @{ $periods{$mid}{$period} }, $day;
+        }
+    }
+
+    my @periods_sorted = sort { $a cmp $b } keys %{ { map { %{ $periods{$_} } } keys %periods } };
+    for my $mid (keys %periods) {
+        for my $p (keys %{ $periods{$mid} }) {
+            $periods{$mid}{$p} = [ sort { $a->{date} cmp $b->{date} } @{ $periods{$mid}{$p} } ];
+        }
+    }
+
+    return {
+        merchants => [ sort { $a->{merchant_id} cmp $b->{merchant_id} } @$merchants ],
+        periods   => \@periods_sorted,
+        daily     => \%periods,    # merchant_id -> period -> [days]
+    };
+}
+
+sub summarize {
+    my ($days) = @_;
+    my %s = (transactions => 0, amount => 0, fee => 0, payout => 0);
+    for my $d (@$days) { $s{$_} += $d->{$_} for keys %s }
+    return \%s;
+}
+
+sub statement_csv {
+    my ($days) = @_;
+    my @cols = qw(transactions amount fee payout);
+    my $csv  = "date,settlement_date,transactions,amount,fee,payout\n";
+    $csv .= join(',', $_->{date}, $_->{settlement_date}, @{$_}{@cols}) . "\n" for @$days;
+    my $s = summarize($days);
+    $csv .= join(',', 'TOTAL', '', @{$s}{@cols}) . "\n";
+    return $csv;
+}
+
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+
+sub cmd_build {
+    my $f = load_figures();
+    my $counter = count_button_presses();
+    my $built_at = strftime('%Y-%m-%d %H:%M:%S UTC', gmtime);
+
+    make_path("$OUT/api");
+    write_file("$OUT/api/merchants.json", $JSON->encode([
+        map { my $m = $_; +{ map { $_ => $m->{$_} } qw(merchant_id merchant_name agency_id agency_name distributor_id distributor_name) } } @{ $f->{merchants} }
+    ]));
+    write_file("$OUT/api/counter.json", $JSON->encode({ %$counter, counted_at => $built_at }));
+    write_file("$OUT/index.html", page_index($f));
+
+    for my $m (@{ $f->{merchants} }) {
+        my $mid = $m->{merchant_id};
+        make_path("$OUT/m/$mid", "$OUT/api/m/$mid");
+        write_file("$OUT/m/$mid/index.html", page_redirect("$f->{periods}[-1].html"));
+        for my $p (@{ $f->{periods} }) {
+            my $days = $f->{daily}{$mid}{$p} // [];
+            my $summary = summarize($days);
+            make_path("$OUT/api/m/$mid/$p");
+            write_file("$OUT/m/$mid/$p.csv", statement_csv($days));
+            write_file("$OUT/api/m/$mid/$p/summary.json", $JSON->encode({ merchant_id => $mid, period => $p, %$summary }));
+            write_file("$OUT/api/m/$mid/$p/daily.json", $JSON->encode($days));
+            write_file("$OUT/m/$mid/$p.html", page_period($f, $m, $p, $days, $summary, $counter, $built_at));
+        }
+    }
+    printf "built %d merchants x %d periods (button pressed %d times)\n",
+        scalar @{ $f->{merchants} }, scalar @{ $f->{periods} }, $counter->{total};
+}
+
+# FR-4. A press is a successful GET of a statement CSV, as recorded in the
+# access log (Common Log Format). Counting happens at build time, so the panel
+# is at most one cron interval stale.
+sub count_button_presses {
+    my %c = (total => 0, by_merchant => {});
+    open my $fh, '<', "$LOGS/access.log" or return \%c;
+    while (my $line = <$fh>) {
+        next unless $line =~ m{^\S+ \S+ \S+ \[[^\]]+\] "GET /m/(M\d{3})/\d{4}-\d{2}\.csv(?:\?\S*)? HTTP/1\.[01]" 200 };
+        $c{total}++;
+        $c{by_merchant}{$1}++;
+    }
+    return \%c;
+}
+
+# ---------------------------------------------------------------------------
+# HTML. Server-side rendered, as was the custom.
+# ---------------------------------------------------------------------------
+
+my $STYLE = <<'CSS';
+body { font-family: Georgia, "Times New Roman", serif; max-width: 860px; margin: 2em auto; padding: 0 1em; color: #111; background: #fdfcf8; }
+h1 { font-size: 1.6em; margin-bottom: 0; }
+.crumb { color: #666; margin-top: .2em; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid #999; padding: .3em .6em; }
+th { background: #eee; text-align: left; }
+td.n { text-align: right; font-family: "Courier New", monospace; }
+nav a { margin-right: .8em; }
+.button { display: inline-block; padding: .6em 1.2em; background: #003399; color: #fff; text-decoration: none; border: 2px outset #6699ff; font-weight: bold; }
+.counter { border: 1px dashed #999; padding: .6em 1em; margin: 1em 0; background: #fffbe6; }
+footer { color: #888; font-size: .85em; margin-top: 3em; }
+CSS
+
+sub html_doc {
+    my ($title, $body) = @_;
+    return <<"HTML";
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${\ esc($title)}</title>
+<style>
+$STYLE</style>
+</head>
+<body>
+$body<footer>Acme Payments merchant portal &middot; fictional data &middot; Chapter 0: one Perl script and a cron job.</footer>
+</body>
+</html>
+HTML
+}
+
+sub page_index {
+    my ($f) = @_;
+    my $rows = join '', map {
+        sprintf qq{<tr><td><a href="m/%s/">%s</a></td><td>%s</td><td>%s</td></tr>\n},
+            $_->{merchant_id}, esc($_->{merchant_name}), esc($_->{agency_name}), esc($_->{distributor_name})
+    } @{ $f->{merchants} };
+    return html_doc('Acme Payments — Merchant Portal', <<"HTML");
+<h1>Acme Payments — Merchant Portal</h1>
+<p class="crumb">Select your merchant account.</p>
+<table>
+<tr><th>Merchant</th><th>Agency</th><th>Distributor</th></tr>
+$rows</table>
+HTML
+}
+
+sub page_redirect {
+    my ($target) = @_;
+    return qq{<!DOCTYPE html>\n<meta charset="utf-8">\n<meta http-equiv="refresh" content="0; url=$target">\n<a href="$target">Continue</a>\n};
+}
+
+sub page_period {
+    my ($f, $m, $period, $days, $s, $counter, $built_at) = @_;
+    my $mid = $m->{merchant_id};
+    my $nav = join '', map {
+        $_ eq $period ? "<strong>$_</strong> " : qq{<a href="$_.html">$_</a>}
+    } @{ $f->{periods} };
+    my $rows = join '', map {
+        sprintf qq{<tr><td>%s</td><td>%s</td><td class="n">%s</td><td class="n">%s</td><td class="n">%s</td><td class="n">%s</td></tr>\n},
+            $_->{date}, $_->{settlement_date}, map { commify($_) } @{$_}{qw(transactions amount fee payout)}
+    } @$days;
+    my $mine = $counter->{by_merchant}{$mid} // 0;
+    return html_doc("$m->{merchant_name} — Settlement $period", <<"HTML");
+<h1>${\ esc($m->{merchant_name})}</h1>
+<p class="crumb">${\ esc($m->{distributor_name})} &rsaquo; ${\ esc($m->{agency_name})} &rsaquo; $mid &middot; fee rate ${\ sprintf('%.2f', $m->{fee_bp} / 100)}%</p>
+<nav>Period: $nav &middot; <a href="../../">all merchants</a></nav>
+
+<h2>Settlement summary — $period</h2>
+<table>
+<tr><th>Transactions</th><th>Amount (KRW)</th><th>Fees (KRW)</th><th>Expected payout (KRW)</th></tr>
+<tr><td class="n">${\ commify($s->{transactions})}</td><td class="n">${\ commify($s->{amount})}</td><td class="n">${\ commify($s->{fee})}</td><td class="n">${\ commify($s->{payout})}</td></tr>
+</table>
+
+<p><a class="button" href="$period.csv" download="acme-statement-$mid-$period.csv">Download settlement statement (CSV)</a></p>
+
+<div class="counter">This button has been pressed <strong>${\ commify($mine)}</strong> times for this merchant,
+<strong>${\ commify($counter->{total})}</strong> times in total. <small>(Counted from the access log at $built_at.)</small></div>
+
+<h2>Daily breakdown</h2>
+<table>
+<tr><th>Date</th><th>Settles on</th><th>Transactions</th><th>Amount</th><th>Fees</th><th>Payout</th></tr>
+$rows</table>
+HTML
+}
+
+# ---------------------------------------------------------------------------
+# serve — a small HTTP/1.0 server. One request at a time, as nature intended.
+# ---------------------------------------------------------------------------
+
+my %MIME = (
+    html => 'text/html; charset=utf-8',
+    csv  => 'text/csv; charset=utf-8',
+    json => 'application/json; charset=utf-8',
+);
+
+sub cmd_serve {
+    my (%opt) = @_;
+    my $port = $opt{port} // 8097;
+    make_path($LOGS);
+    open my $log, '>>', "$LOGS/access.log" or die "cannot open access log: $!\n";
+    $log->autoflush(1);
+
+    my $server = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => $port, Listen => 16, ReuseAddr => 1)
+        or die "cannot listen on $port: $!\n";
+    print "serving $OUT on http://127.0.0.1:$port/\n";
+
+    while (my $client = $server->accept) {
+        my ($status, $bytes, $request) = handle_request($client);
+        printf $log qq{%s - - [%s] "%s" %d %d\n},
+            $client->peerhost // '-', strftime('%d/%b/%Y:%H:%M:%S +0000', gmtime), $request, $status, $bytes;
+        close $client;
+    }
+}
+
+sub handle_request {
+    my ($client) = @_;
+    my $request = <$client> // '';
+    $request =~ s/\r?\n\z//;
+    while (my $h = <$client>) { last if $h =~ /^\r?\n\z/ }
+
+    my ($method, $target) = $request =~ m{^(\S+) (\S+) HTTP/1\.[01]$};
+    return respond($client, 400, 'text/plain', "bad request\n", $request) unless $method;
+    return respond($client, 405, 'text/plain', "GET only\n", $request) unless $method eq 'GET';
+
+    (my $path = $target) =~ s/\?.*//;
+    return respond($client, 404, 'text/plain', "not found\n", $request) if $path =~ /\.\./;
+    $path .= 'index.html' if $path =~ m{/\z};
+    my $file = $OUT . $path;
+    $file .= '/index.html' if -d $file;
+    return respond($client, 404, 'text/plain', "not found\n", $request) unless -f $file;
+
+    my ($ext) = $file =~ /\.(\w+)\z/;
+    my %extra;
+    if (($ext // '') eq 'csv' && $path =~ m{^/m/(M\d{3})/(\d{4}-\d{2})\.csv\z}) {
+        $extra{'Content-Disposition'} = qq{attachment; filename="acme-statement-$1-$2.csv"};
+    }
+    return respond($client, 200, $MIME{ $ext // '' } // 'application/octet-stream', read_file($file), $request, %extra);
+}
+
+sub respond {
+    my ($client, $status, $type, $body, $request, %headers) = @_;
+    my %reason = (200 => 'OK', 400 => 'Bad Request', 404 => 'Not Found', 405 => 'Method Not Allowed');
+    my $head = "HTTP/1.0 $status $reason{$status}\r\nContent-Type: $type\r\nContent-Length: " . length($body) . "\r\n";
+    $head .= "$_: $headers{$_}\r\n" for sort keys %headers;
+    print $client $head, "Connection: close\r\n\r\n", $body;
+    return ($status, length $body, $request);
+}
+
+# ---------------------------------------------------------------------------
+# golden / verify — the contract every later chapter must honour (README P-5)
+# ---------------------------------------------------------------------------
+
+sub golden_lines {
+    my $f = load_figures();
+    my (@summary, @statements);
+    for my $m (@{ $f->{merchants} }) {
+        for my $p (@{ $f->{periods} }) {
+            my $days = $f->{daily}{ $m->{merchant_id} }{$p} // [];
+            my $s = summarize($days);
+            push @summary, join("\t", $m->{merchant_id}, $p, @{$s}{qw(transactions amount fee payout)}) . "\n";
+            push @statements, sha256_hex(statement_csv($days)) . "  m/$m->{merchant_id}/$p.csv\n";
+        }
+    }
+    my @data = map { sha256_hex(read_file("$DATA/$_")) . "  data/$_\n" } qw(merchants.csv transactions.csv);
+    return (
+        'summary.tsv'       => join('', "merchant_id\tperiod\ttransactions\tamount\tfee\tpayout\n", @summary),
+        'statements.sha256' => join('', @statements),
+        'data.sha256'       => join('', @data),
+    );
+}
+
+sub cmd_golden {
+    my %files = golden_lines();
+    make_path($GOLDEN);
+    write_file("$GOLDEN/$_", $files{$_}) for sort keys %files;
+    print "wrote golden figures: ", join(', ', sort keys %files), "\n";
+}
+
+sub cmd_verify {
+    my %files = golden_lines();
+    my $failed = 0;
+    for my $name (sort keys %files) {
+        my $expected = eval { read_file("$GOLDEN/$name") } // '';
+        my $ok = $expected eq $files{$name};
+        printf "%-18s %s\n", $name, $ok ? 'ok' : 'MISMATCH';
+        $failed++ unless $ok;
+    }
+    for my $line (split /\n/, $files{'statements.sha256'}) {
+        my ($hash, $rel) = $line =~ /^(\w+)  (\S+)$/;
+        my $built = eval { read_file("$OUT/$rel") };
+        next if defined $built && sha256_hex($built) eq $hash;
+        print "built file differs or missing: out/$rel\n";
+        $failed++;
+    }
+    die "verify failed ($failed)\n" if $failed;
+    print "verify ok\n";
+}
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+sub parse_options {
+    my %opt;
+    while (my $arg = shift) {
+        die "unknown option $arg\n" unless $arg =~ /^--(seed|port)$/;
+        my $value = shift // die "missing value for $arg\n";
+        die "$arg must be a positive integer\n" unless $value =~ /^\d+$/ && $value > 0;
+        $opt{$1} = $value;
+    }
+    return %opt;
+}
+
+sub date_range {
+    my ($from, $to) = @_;
+    my @days;
+    for (my $d = $from; $d le $to; $d = add_days($d, 1)) { push @days, $d }
+    return @days;
+}
+
+sub add_days {
+    my ($date, $n) = @_;
+    my ($y, $m, $d) = $date =~ /^(\d{4})-(\d{2})-(\d{2})$/ or die "bad date $date\n";
+    return strftime('%Y-%m-%d', gmtime(timegm(0, 0, 12, $d, $m - 1, $y) + $n * 86400));
+}
+
+sub commify {
+    my ($n) = @_;
+    1 while $n =~ s/^(-?\d+)(\d{3})/$1,$2/;
+    return $n;
+}
+
+sub esc {
+    my ($s) = @_;
+    $s =~ s/&/&amp;/g; $s =~ s/</&lt;/g; $s =~ s/>/&gt;/g; $s =~ s/"/&quot;/g;
+    return $s;
+}
+
+sub read_file {
+    my ($path) = @_;
+    open my $fh, '<:raw', $path or die "cannot read $path: $!\n";
+    local $/;
+    return scalar <$fh>;
+}
+
+sub write_file {
+    my ($path, $content) = @_;
+    open my $fh, '>:raw', $path or die "cannot write $path: $!\n";
+    print $fh $content;
+    close $fh or die "cannot close $path: $!\n";
+}
+
+# Our CSVs never contain commas or quotes inside fields, so a split suffices.
+# (The merchant names were chosen with this in mind. That is the 1997 way.)
+sub read_csv {
+    my ($path) = @_;
+    open my $fh, '<:raw', $path or die "cannot read $path: $! (run `generate` first)\n";
+    chomp(my $header = <$fh>);
+    my @cols = split /,/, $header;
+    my @rows;
+    while (my $line = <$fh>) {
+        chomp $line;
+        my %r;
+        @r{@cols} = split /,/, $line, -1;
+        push @rows, \%r;
+    }
+    return \@rows;
+}
+
+sub write_csv {
+    my ($path, $cols, $rows) = @_;
+    write_file($path, join('', join(',', @$cols) . "\n", map { join(',', @$_) . "\n" } @$rows));
+}
+
+# ---------------------------------------------------------------------------
+# Main. Kept at the bottom so every file-scoped table above is initialised
+# before a command runs.
+# ---------------------------------------------------------------------------
+
+my $command = shift @ARGV // '';
+die "usage: perl button.pl <" . join('|', sort keys %COMMANDS) . "> [options]\n"
+    unless $COMMANDS{$command};
+$COMMANDS{$command}->(parse_options(@ARGV));
+exit 0;

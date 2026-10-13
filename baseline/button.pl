@@ -25,6 +25,8 @@ use POSIX qw(strftime);
 use IO::Socket::INET;
 use JSON::PP;
 use Digest::SHA qw(sha256_hex);
+use File::Glob qw(bsd_glob);
+use File::Find qw(find);
 
 my $DATA   = "$Bin/data";
 my $OUT    = "$Bin/out";
@@ -251,6 +253,7 @@ sub cmd_build {
         map { my $m = $_; +{ map { $_ => $m->{$_} } qw(merchant_id merchant_name agency_id agency_name distributor_id distributor_name) } } @{ $f->{merchants} }
     ]));
     write_file("$OUT/api/counter.json", $JSON->encode({ %$counter, counted_at => $built_at }));
+    write_file("$OUT/api/periods.json", $JSON->encode({ periods => $f->{periods} }));
     write_file("$OUT/index.html", page_index($f));
 
     for my $m (@{ $f->{merchants} }) {
@@ -267,17 +270,31 @@ sub cmd_build {
             write_file("$OUT/m/$mid/$p.html", page_period($f, $m, $p, $days, $summary, $counter, $built_at));
         }
     }
+    remove_stale_outputs();
     printf "built %d merchants x %d periods (button pressed %d times)\n",
         scalar @{ $f->{merchants} }, scalar @{ $f->{periods} }, $counter->{total};
 }
 
-# FR-4. A press is a GET of a statement CSV whose 200 response was handed to
-# the operating system in full without error, as recorded in the access log
-# (Common Log Format). If writing or closing the socket fails — the client had
-# already disconnected — the line is logged as 499 and is not a press. A client
-# that disconnects after the OS has accepted the bytes cannot be detected and is
-# counted; that is the limit of what a server can know. Counting happens at
-# build time, so the panel is at most one cron interval stale.
+# Every file this build writes is recorded by write_file; anything else left in
+# out/ by an earlier build (a period or merchant that no longer exists) is
+# removed so that it can no longer be served or counted.
+my %WRITTEN;
+
+sub remove_stale_outputs {
+    my @stale;
+    find({ no_chdir => 1, wanted => sub { push @stale, $_ if -f $_ && !$WRITTEN{$_} } }, $OUT);
+    unlink @stale;
+}
+
+# FR-4. A press is a GET of a statement CSV path that the server answered with
+# 200, as recorded in the access log (Common Log Format). The only exception is
+# a response the server failed to write (the socket refused it); that is
+# logged as 499 and is not a press. Whether the client actually read the bytes
+# is not considered: a client that closes politely before reading is still
+# counted, because the server did answer. Later chapters reproduce this rule:
+# "answered 200, and the answer was successfully written".
+# Counting happens at build time, so the panel is at most one cron interval
+# stale.
 sub count_button_presses {
     my %c = (total => 0, by_merchant => {});
     open my $fh, '<', "$LOGS/access.log" or return \%c;
@@ -352,11 +369,12 @@ sub page_period {
     # Identifiers are pattern-checked upstream; escaped anyway for consistency.
     my ($mid_html, $period_html) = (esc($mid), esc($period));
     my $nav = join '', map {
-        $_ eq $period ? "<strong>$_</strong> " : qq{<a href="$_.html">$_</a>}
+        my $p = esc($_);
+        $_ eq $period ? "<strong>$p</strong> " : qq{<a href="$p.html">$p</a>}
     } @{ $f->{periods} };
     my $rows = join '', map {
         sprintf qq{<tr><td>%s</td><td>%s</td><td class="n">%s</td><td class="n">%s</td><td class="n">%s</td><td class="n">%s</td></tr>\n},
-            $_->{date}, $_->{settlement_date}, map { commify($_) } @{$_}{qw(transactions amount fee payout)}
+            esc($_->{date}), esc($_->{settlement_date}), map { commify($_) } @{$_}{qw(transactions amount fee payout)}
     } @$days;
     my $mine = $counter->{by_merchant}{$mid} // 0;
     return html_doc("$m->{merchant_name} — Settlement $period", <<"HTML");
@@ -364,7 +382,7 @@ sub page_period {
 <p class="crumb">${\ esc($m->{distributor_name})} &rsaquo; ${\ esc($m->{agency_name})} &rsaquo; $mid_html &middot; fee rate ${\ bp_percent($m->{fee_bp})}%</p>
 <nav>Period: $nav &middot; <a href="../../">all merchants</a></nav>
 
-<h2>Settlement summary — $period</h2>
+<h2>Settlement summary — $period_html</h2>
 <table>
 <tr><th>Transactions</th><th>Amount (KRW)</th><th>Fees (KRW)</th><th>Expected payout (KRW)</th></tr>
 <tr><td class="n">${\ commify($s->{transactions})}</td><td class="n">${\ commify($s->{amount})}</td><td class="n">${\ commify($s->{fee})}</td><td class="n">${\ commify($s->{payout})}</td></tr>
@@ -406,7 +424,12 @@ sub cmd_serve {
         or die "cannot listen on $port: $!\n";
     print "serving $OUT on http://127.0.0.1:$port/\n";
 
-    while (my $client = $server->accept) {
+    while (1) {
+        my $client = $server->accept;
+        unless ($client) {
+            next if $!{EINTR} || $!{ECONNABORTED};
+            die "accept failed: $!\n";
+        }
         my $peer = $client->peerhost // '-';
         my ($status, $bytes, $request) = handle_request($client);    # closes $client
         printf $log qq{%s - - [%s] "%s" %d %d\n},
@@ -418,6 +441,7 @@ sub cmd_serve {
 # its request headers would block everyone else, so reading is capped at
 # $READ_TIMEOUT seconds; such a client gets a 408 and is dropped.
 my $READ_TIMEOUT = 5;
+my $MAX_HEADER_BYTES = 8192;    # request line plus headers
 
 # Common Log Format timestamp in UTC, with English month names regardless of
 # locale (strftime's %b follows LC_TIME).
@@ -433,13 +457,21 @@ sub handle_request {
     my $complete = eval {
         local $SIG{ALRM} = sub { die "timeout\n" };
         alarm $READ_TIMEOUT;
-        $request = <$client> // '';
-        while (my $h = <$client>) { last if $h =~ /^\r?\n\z/ }
+        my $buf = '';
+        while ($buf !~ /\r?\n\r?\n/ && length $buf <= $MAX_HEADER_BYTES) {
+            my $n = sysread($client, $buf, 4096, length $buf);
+            last unless $n;    # EOF or error: parse what arrived
+        }
         alarm 0;
+        ($request) = $buf =~ /\A([^\r\n]*)/;
+        die "too large\n" if length $buf > $MAX_HEADER_BYTES && $buf !~ /\r?\n\r?\n/;
         1;
     };
+    my $error = $@;
     alarm 0;
-    $request =~ s/\r?\n\z//;
+    $request //= '';
+    return respond($client, 400, 'text/plain', "request too large\n", substr($request, 0, 200))
+        if !$complete && $error eq "too large\n";
     return respond($client, 408, 'text/plain', "request timeout\n", $request) unless $complete;
 
     my ($method, $target) = $request =~ m{^(\S+) (\S+) HTTP/1\.[01]$};
@@ -454,12 +486,12 @@ sub handle_request {
     # successful statement download has exactly one spelling in the log (FR-4).
     # It also excludes `..`, `//` and `/./` by construction.
     return respond($client, 301, 'text/plain', "moved\n", $request, Location => "$path/")
-        if $path =~ m{\A/m/M\d{3}\z};
+        if $path =~ m{\A/m/M\d{3}\z} && -d $OUT . $path;
     return respond($client, 404, 'text/plain', "not found\n", $request)
         unless $path =~ m{\A(?:
               /(?:index\.html)?
             | /m/M\d{3}/(?:index\.html|\d{4}-\d{2}\.(?:csv|html))?
-            | /api/(?:merchants|counter)\.json
+            | /api/(?:merchants|counter|periods)\.json
             | /api/m/M\d{3}/\d{4}-\d{2}/(?:summary|daily)\.json
         )\z}x;
     $path .= 'index.html' if $path =~ m{/\z};
@@ -538,7 +570,7 @@ sub cmd_verify {
         $failed++;
     }
     my %expected = map { /  (\S+)$/ ? ($1 => 1) : () } split /\n/, $files{'statements.sha256'};
-    for my $csv (sort glob "$OUT/m/*/*.csv") {
+    for my $csv (sort { $a cmp $b } bsd_glob("$OUT/m/*/*.csv")) {
         (my $rel = $csv) =~ s{^\Q$OUT\E/}{};
         next if $expected{$rel};
         print "unexpected file in out/: $rel\n";
@@ -630,6 +662,7 @@ sub write_file {
     print $fh $content;
     close $fh or die "cannot close $tmp: $!\n";
     rename $tmp, $path or die "cannot rename $tmp to $path: $!\n";
+    $WRITTEN{$path} = 1;
 }
 
 # Our CSVs never contain commas or quotes inside fields, so a split suffices.

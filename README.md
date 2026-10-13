@@ -116,6 +116,12 @@ Distributor
 
 Monetary amounts are integers in the minor unit. Rates are integers in basis points. Floating point is not permitted anywhere money is concerned, a position on which every stakeholder, unusually, agrees.
 
+### 4.3 Reference rendering
+
+As delivered by Chapter 0. Later chapters SHALL render the same figures; they MAY render them less legibly.
+
+<img src="docs/assets/screenshots/ch0-baseline.png" width="720" alt="Chapter 0: settlement summary, the Button, the press counter and the daily breakdown for a fictional merchant">
+
 ## 5. Stakeholder Advisory Register
 
 *Also known internally as "this guy".*
@@ -213,7 +219,7 @@ Chapters are delivered sequentially; each builds on the last. Each chapter is ti
 
 | Ch | Title | Stakeholders | Status | Report |
 |---|---|---|---|---|
-| 0 | Baseline | S-07 | ⏳ In progress | — |
+| 0 | Baseline | S-07 | ✅ Shipped (frozen) | — |
 | 1 | Architecture | S-01 | Not started | — |
 | 2 | Stack & Runtime | S-02 | Not started | — |
 | 3 | Maintenance | S-03, S-04 | Not started | — |
@@ -234,15 +240,21 @@ Measured after every chapter, against Chapter 0, on the same machine with the sa
 
 | Metric | Ch 0 | Ch 1 | Ch 2 | Ch 3 | Ch 4 | Ch 5 | Ch 6 | Ch 7 | Ch 8 | Ch 9 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Time until the button worked | | | | | | | | | | |
-| Lines of code | | | | | | | | | | |
-| Languages | | | | | | | | | | |
-| Dependencies (direct / transitive) | | | | | | | | | | |
-| Build time (cold / warm) | | | | | | | | | | |
-| Memory, full stack running | | | | | | | | | | |
-| Button → CSV latency (p50 / p95) | | | | | | | | | | |
-| Processes / containers | | | | | | | | | | |
-| Configuration lines (of which YAML) | | | | | | | | | | |
+| Time until the button worked | 2 min 24 s | | | | | | | | | |
+| Lines of code | 724 (513 excl. blanks and comments) | | | | | | | | | |
+| Languages | 1 (Perl) | | | | | | | | | |
+| Dependencies (direct / transitive) | 0 / 0 | | | | | | | | | |
+| Build time (cold / warm) | pending¹ | | | | | | | | | |
+| Memory, full stack running | 13 MB | | | | | | | | | |
+| Button → CSV latency (p50 / p95) | pending¹ | | | | | | | | | |
+| Processes / containers | 1 / 0 | | | | | | | | | |
+| Configuration lines (of which YAML) | 1 (0) | | | | | | | | | |
+
+¹ Deferred. At the time of measurement the host was running unrelated workloads (load average ≈ 40 on 10 cores). Timings taken under contention would flatter later chapters, so they will be taken on an idle machine and entered here.
+
+Chapter 0 notes:
+- *Time until the button worked* is the interval from branch creation to the first successful CSV download. The baseline then went through **seven rounds of independent review** before it was frozen. The first six each found a real defect, and fixing them turned up more. Among them: CLI options that were silently ignored, case-insensitive routing on macOS, aborted downloads counted as presses, and a log-truncation bug that silently stopped counting long requests. One Perl script and a cron job is less simple than it sounds once its numbers have to be trusted.
+- *Configuration lines* counts the single crontab entry. There is no YAML, as S-07 required.
 
 A load test at **200,001 virtual users** (S-01) will be attempted on a single laptop. The point at which it fails, and what fails first, will be reported as a metric in its own right.
 
@@ -254,7 +266,27 @@ A load test at **200,001 virtual users** (S-01) will be attempted on a single la
 
 ## 11. Operating Instructions
 
-To be issued upon completion of Chapter 0. Instructions are expected to grow monotonically.
+Instructions are expected to grow monotonically.
+
+### Chapter 0 — Baseline
+
+Requires Perl 5 built with 64-bit integers (the macOS and most Linux system perls qualify). Core modules only; nothing to install.
+
+```sh
+cd baseline
+perl button.pl generate          # synthetic data -> data/  (fixed seed)
+perl button.pl build             # pages, statements, API, counter -> out/
+perl button.pl verify            # check data and output against ../golden/
+perl button.pl serve             # http://127.0.0.1:8097/
+```
+
+The button counter is refreshed by `build`. In accordance with S-07, this is the job of cron:
+
+```cron
+* * * * * cd /path/to/shipping-a-button/baseline && /usr/bin/perl button.pl build >> logs/cron.log 2>&1
+```
+
+The baseline is frozen (P-4). It is the reference every later chapter is measured and verified against.
 
 ---
 

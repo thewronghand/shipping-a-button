@@ -157,7 +157,8 @@ sub cmd_generate {
 #   - settlement date = transaction date + 2 calendar days
 #   - a period is a calendar month of the TRANSACTION date (not the settlement
 #     date): a 07-30 transaction settles on 08-01 but belongs to 2026-07
-#   - the list of periods is the set of months present in the data
+#   - the list of periods is the set of months containing at least one
+#     approved transaction (across all merchants)
 #
 # Statement CSV format (byte-exact; compared by golden/statements.sha256):
 #   - UTF-8, LF line endings, no BOM, no quoting
@@ -352,7 +353,7 @@ sub page_period {
     my $mine = $counter->{by_merchant}{$mid} // 0;
     return html_doc("$m->{merchant_name} — Settlement $period", <<"HTML");
 <h1>${\ esc($m->{merchant_name})}</h1>
-<p class="crumb">${\ esc($m->{distributor_name})} &rsaquo; ${\ esc($m->{agency_name})} &rsaquo; $mid &middot; fee rate ${\ sprintf('%.2f', $m->{fee_bp} / 100)}%</p>
+<p class="crumb">${\ esc($m->{distributor_name})} &rsaquo; ${\ esc($m->{agency_name})} &rsaquo; $mid &middot; fee rate ${\ bp_percent($m->{fee_bp})}%</p>
 <nav>Period: $nav &middot; <a href="../../">all merchants</a></nav>
 
 <h2>Settlement summary — $period</h2>
@@ -400,7 +401,7 @@ sub cmd_serve {
     while (my $client = $server->accept) {
         my ($status, $bytes, $request) = handle_request($client);
         printf $log qq{%s - - [%s] "%s" %d %d\n},
-            $client->peerhost // '-', strftime('%d/%b/%Y:%H:%M:%S +0000', gmtime), log_escape($request), $status, $bytes;
+            $client->peerhost // '-', clf_time(), log_escape($request), $status, $bytes;
         close $client;
     }
 }
@@ -409,6 +410,14 @@ sub cmd_serve {
 # its request headers would block everyone else, so reading is capped at
 # $READ_TIMEOUT seconds; such a client gets a 408 and is dropped.
 my $READ_TIMEOUT = 5;
+
+# Common Log Format timestamp in UTC, with English month names regardless of
+# locale (strftime's %b follows LC_TIME).
+sub clf_time {
+    my @t = gmtime;
+    my @mon = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    return sprintf '%02d/%s/%04d:%02d:%02d:%02d +0000', $t[3], $mon[ $t[4] ], $t[5] + 1900, $t[2], $t[1], $t[0];
+}
 
 sub handle_request {
     my ($client) = @_;
@@ -430,14 +439,21 @@ sub handle_request {
     return respond($client, 405, 'text/plain', "GET only\n", $request) unless $method eq 'GET';
 
     (my $path = $target) =~ s/\?.*//;
-    # Only canonical paths are served: a leading slash, then segments made of
-    # [A-Za-z0-9_.-] that are neither empty nor dot-only. This rejects `..`,
-    # `//`, `/./` and anything that could resolve outside out/, and guarantees
-    # that every successful CSV download has exactly one spelling in the log.
-    return respond($client, 404, 'text/plain', "not found\n", $request)
-        unless $path =~ m{\A(?:/(?!\.+(?:/|\z))[\w.-]+)*/?\z};
+    # Routing is an exact, case-sensitive allow-list checked BEFORE the
+    # filesystem is touched. macOS filesystems are case-insensitive by default,
+    # so relying on -f would serve /M/m001/2026-07.CSV as well; the allow-list
+    # makes behaviour identical on every platform and guarantees that each
+    # successful statement download has exactly one spelling in the log (FR-4).
+    # It also excludes `..`, `//` and `/./` by construction.
     return respond($client, 301, 'text/plain', "moved\n", $request, Location => "$path/")
-        if $path !~ m{/\z} && -d $OUT . $path;
+        if $path =~ m{\A/m/M\d{3}\z};
+    return respond($client, 404, 'text/plain', "not found\n", $request)
+        unless $path =~ m{\A(?:
+              /(?:index\.html)?
+            | /m/M\d{3}/(?:index\.html|\d{4}-\d{2}\.(?:csv|html))?
+            | /api/(?:merchants|counter)\.json
+            | /api/m/M\d{3}/\d{4}-\d{2}/(?:summary|daily)\.json
+        )\z}x;
     $path .= 'index.html' if $path =~ m{/\z};
     my $file = $OUT . $path;
     return respond($client, 404, 'text/plain', "not found\n", $request) unless -f $file;
@@ -518,12 +534,20 @@ sub cmd_verify {
 # Utilities
 # ---------------------------------------------------------------------------
 
+my %OPTIONS = (generate => ['seed'], serve => ['port']);
+
 sub parse_options {
+    my ($command, @args) = @_;
+    my %allowed = map { $_ => 1 } @{ $OPTIONS{$command} // [] };
     my %opt;
-    while (my $arg = shift) {
-        my ($name) = $arg =~ /^--(seed|port)$/ or die "unknown option $arg\n";
-        my $value = shift // die "missing value for $arg\n";
+    while (@args) {
+        my $arg = shift @args;
+        my ($name) = $arg =~ /^--(\w+)$/;
+        die "unknown option $arg for $command\n" unless defined $name && $allowed{$name};
+        die "missing value for $arg\n" unless @args;
+        my $value = shift @args;
         die "$arg must be a positive integer\n" unless $value =~ /^\d+$/ && $value > 0;
+        die "$arg must be at most 65535\n" if $name eq 'port' && $value > 65535;
         $opt{$name} = $value;
     }
     return %opt;
@@ -551,6 +575,13 @@ sub log_escape {
     return $s;
 }
 
+# 330 -> "3.30". Integer formatting only.
+sub bp_percent {
+    my ($bp) = @_;
+    use integer;
+    return sprintf('%d.%02d', $bp / 100, $bp % 100);
+}
+
 sub commify {
     my ($n) = @_;
     1 while $n =~ s/^(-?\d+)(\d{3})/$1,$2/;
@@ -570,11 +601,16 @@ sub read_file {
     return scalar <$fh>;
 }
 
+# Write to a temporary file and rename it into place. The cron `build`
+# rewrites out/ while the server is running; rename is atomic on the same
+# filesystem, so a request never sees a truncated or half-written file.
 sub write_file {
     my ($path, $content) = @_;
-    open my $fh, '>:raw', $path or die "cannot write $path: $!\n";
+    my $tmp = "$path.tmp.$$";
+    open my $fh, '>:raw', $tmp or die "cannot write $tmp: $!\n";
     print $fh $content;
-    close $fh or die "cannot close $path: $!\n";
+    close $fh or die "cannot close $tmp: $!\n";
+    rename $tmp, $path or die "cannot rename $tmp to $path: $!\n";
 }
 
 # Our CSVs never contain commas or quotes inside fields, so a split suffices.
@@ -607,5 +643,5 @@ sub write_csv {
 my $command = shift @ARGV // '';
 die "usage: perl button.pl <" . join('|', sort keys %COMMANDS) . "> [options]\n"
     unless $COMMANDS{$command};
-$COMMANDS{$command}->(parse_options(@ARGV));
+$COMMANDS{$command}->(parse_options($command, @ARGV));
 exit 0;

@@ -6,3 +6,9 @@ AGENTS.md
 # macOS
 .DS_Store
 *.log
+
+# Chapter 0 build outputs
+baseline/data/
+baseline/out/
+baseline/logs/
+baseline/.build.lock

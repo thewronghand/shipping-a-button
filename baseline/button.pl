@@ -476,9 +476,13 @@ sub handle_request {
         1;
     };
     alarm 0;
-    my ($request) = $buf =~ /\A([^\r\n]*)/;
-    $request = substr($request // '', 0, 200);
+    # The request line runs to the first LF, minus an optional CR before it.
+    # It is parsed and logged in full; the 8 KB header cap already bounds it.
+    my ($request) = $buf =~ /\A([^\n]*)/;
+    $request //= '';
+    $request =~ s/\r\z//;
     return respond($client, 408, 'text/plain', "request timeout\n", $request) unless $complete;
+    return respond($client, 400, 'text/plain', "bad request\n", $request) if $request =~ /\r/;
     my ($head) = $buf =~ /\A(.*?\r?\n\r?\n)/s;
     return respond($client, 400, 'text/plain', "request too large\n", $request)
         if length($head // $buf) > $MAX_HEADER_BYTES;
@@ -513,7 +517,11 @@ sub handle_request {
     if (($ext // '') eq 'csv' && $path =~ m{^/m/(M\d{3})/(\d{4}-\d{2})\.csv\z}) {
         $extra{'Content-Disposition'} = qq{attachment; filename="acme-statement-$1-$2.csv"};
     }
-    return respond($client, 200, $MIME{ $ext // '' } // 'application/octet-stream', read_file($file), $request, %extra);
+    # The file can vanish between -f and the read (a concurrent build removing a
+    # stale output); answer 404 rather than letting the server die.
+    my $body = eval { read_file($file) };
+    return respond($client, 404, 'text/plain', "not found\n", $request) unless defined $body;
+    return respond($client, 200, $MIME{ $ext // '' } // 'application/octet-stream', $body, $request, %extra);
 }
 
 # Writes are not timed out. Every response is small enough (< 32 KB) to fit in

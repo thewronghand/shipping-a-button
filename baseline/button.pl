@@ -27,6 +27,7 @@ use JSON::PP;
 use Digest::SHA qw(sha256_hex);
 use File::Glob qw(bsd_glob);
 use File::Find qw(find);
+use Fcntl qw(:flock);
 
 my $DATA   = "$Bin/data";
 my $OUT    = "$Bin/out";
@@ -61,6 +62,7 @@ my $rng_state;
 
 sub seed_rng {
     my ($seed) = @_;
+    die "this script needs a perl with 64-bit integers\n" unless ~0 > 2**47;
     $rng_state = $seed % 2147483647;
     $rng_state = 1 if $rng_state <= 0;
 }
@@ -244,6 +246,11 @@ sub statement_csv {
 # ---------------------------------------------------------------------------
 
 sub cmd_build {
+    # Builds are serialised: a slow cron run and a manual run must not
+    # interleave writes or sweep each other's temporary files.
+    open my $lock, '>', "$Bin/.build.lock" or die "cannot open build lock: $!\n";
+    flock $lock, LOCK_EX or die "cannot lock build: $!\n";
+
     my $f = load_figures();
     my $counter = count_button_presses();
     my $built_at = strftime('%Y-%m-%d %H:%M:%S UTC', gmtime);
@@ -282,7 +289,7 @@ my %WRITTEN;
 
 sub remove_stale_outputs {
     my @stale;
-    find({ no_chdir => 1, wanted => sub { push @stale, $_ if -f $_ && !$WRITTEN{$_} } }, $OUT);
+    find({ no_chdir => 1, wanted => sub { push @stale, $_ if -f $_ && !$WRITTEN{$_} && !/\.tmp\.\d+\z/ } }, $OUT);
     unlink @stale;
 }
 
@@ -291,7 +298,8 @@ sub remove_stale_outputs {
 # a response the server failed to write (the socket refused it); that is
 # logged as 499 and is not a press. Whether the client actually read the bytes
 # is not considered: a client that closes politely before reading is still
-# counted, because the server did answer. Later chapters reproduce this rule:
+# counted, because the server did answer. A request is only answered once its
+# header block is complete (see handle_request). Later chapters reproduce this rule:
 # "answered 200, and the answer was successfully written".
 # Counting happens at build time, so the panel is at most one cron interval
 # stale.
@@ -347,7 +355,7 @@ sub page_index {
     my ($f) = @_;
     my $rows = join '', map {
         sprintf qq{<tr><td><a href="m/%s/">%s</a></td><td>%s</td><td>%s</td></tr>\n},
-            $_->{merchant_id}, esc($_->{merchant_name}), esc($_->{agency_name}), esc($_->{distributor_name})
+            esc($_->{merchant_id}), esc($_->{merchant_name}), esc($_->{agency_name}), esc($_->{distributor_name})
     } @{ $f->{merchants} };
     return html_doc('Acme Payments — Merchant Portal', <<"HTML");
 <h1>Acme Payments — Merchant Portal</h1>
@@ -366,7 +374,7 @@ sub page_redirect {
 sub page_period {
     my ($f, $m, $period, $days, $s, $counter, $built_at) = @_;
     my $mid = $m->{merchant_id};
-    # Identifiers are pattern-checked upstream; escaped anyway for consistency.
+    # Identifiers come from generated data; escaped anyway, like everything else.
     my ($mid_html, $period_html) = (esc($mid), esc($period));
     my $nav = join '', map {
         my $p = esc($_);
@@ -453,26 +461,28 @@ sub clf_time {
 
 sub handle_request {
     my ($client) = @_;
-    my $request = '';
+    # A request is only answered once its header block is complete (a blank
+    # line ends it, CRLF or bare LF). A client that closes before that gets a
+    # 400 and so can never produce a counted press.
+    my $buf = '';
     my $complete = eval {
         local $SIG{ALRM} = sub { die "timeout\n" };
         alarm $READ_TIMEOUT;
-        my $buf = '';
         while ($buf !~ /\r?\n\r?\n/ && length $buf <= $MAX_HEADER_BYTES) {
             my $n = sysread($client, $buf, 4096, length $buf);
-            last unless $n;    # EOF or error: parse what arrived
+            last unless $n;
         }
         alarm 0;
-        ($request) = $buf =~ /\A([^\r\n]*)/;
-        die "too large\n" if length $buf > $MAX_HEADER_BYTES && $buf !~ /\r?\n\r?\n/;
         1;
     };
-    my $error = $@;
     alarm 0;
-    $request //= '';
-    return respond($client, 400, 'text/plain', "request too large\n", substr($request, 0, 200))
-        if !$complete && $error eq "too large\n";
+    my ($request) = $buf =~ /\A([^\r\n]*)/;
+    $request = substr($request // '', 0, 200);
     return respond($client, 408, 'text/plain', "request timeout\n", $request) unless $complete;
+    my ($head) = $buf =~ /\A(.*?\r?\n\r?\n)/s;
+    return respond($client, 400, 'text/plain', "request too large\n", $request)
+        if length($head // $buf) > $MAX_HEADER_BYTES;
+    return respond($client, 400, 'text/plain', "incomplete request\n", $request) unless defined $head;
 
     my ($method, $target) = $request =~ m{^(\S+) (\S+) HTTP/1\.[01]$};
     return respond($client, 400, 'text/plain', "bad request\n", $request) unless $method;
@@ -506,6 +516,9 @@ sub handle_request {
     return respond($client, 200, $MIME{ $ext // '' } // 'application/octet-stream', read_file($file), $request, %extra);
 }
 
+# Writes are not timed out. Every response is small enough (< 32 KB) to fit in
+# the kernel's socket buffer, so a client that never reads cannot block the
+# single-threaded server here.
 sub respond {
     my ($client, $status, $type, $body, $request, %headers) = @_;
     my %reason = (200 => 'OK', 301 => 'Moved Permanently', 400 => 'Bad Request', 404 => 'Not Found',
@@ -596,7 +609,7 @@ sub parse_options {
         die "unknown option $arg for $command\n" unless defined $name && $allowed{$name};
         die "missing value for $arg\n" unless @args;
         my $value = shift @args;
-        die "$arg must be a positive integer\n" unless $value =~ /^\d+$/ && $value > 0;
+        die "$arg must be a positive integer\n" unless $value =~ /\A\d+\z/ && $value > 0;
         die "$arg must be at most 65535\n"      if $name eq 'port' && $value > 65535;
         die "$arg must be at most 2147483646\n" if $name eq 'seed' && $value > 2147483646;
         $opt{$name} = $value;

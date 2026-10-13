@@ -247,7 +247,10 @@ sub statement_csv {
 
 sub cmd_build {
     # Builds are serialised: a slow cron run and a manual run must not
-    # interleave writes or sweep each other's temporary files.
+    # interleave writes or sweep each other's temporary files. The lock file
+    # lives next to this script, so the user running build (e.g. cron) needs
+    # write access to this directory. Temporary files left by a crashed build
+    # are never served and are harmless.
     open my $lock, '>', "$Bin/.build.lock" or die "cannot open build lock: $!\n";
     flock $lock, LOCK_EX or die "cannot lock build: $!\n";
 
@@ -477,7 +480,8 @@ sub handle_request {
     };
     alarm 0;
     # The request line runs to the first LF, minus an optional CR before it.
-    # It is parsed and logged in full; the 8 KB header cap already bounds it.
+    # It is parsed and logged in full. The header cap bounds it at roughly
+    # 12 KB (the 8 KB cap plus one 4 KB read).
     my ($request) = $buf =~ /\A([^\n]*)/;
     $request //= '';
     $request =~ s/\r\z//;

@@ -145,12 +145,26 @@ sub cmd_generate {
 # Figures
 #
 # Rules (shared by every chapter):
+#   - input is data/merchants.csv and data/transactions.csv, as pinned by
+#     golden/data.sha256. Later chapters consume these files; they need not
+#     reimplement the generator. (The `time` and `method` columns are carried
+#     but do not affect any figure.)
 #   - only approved transactions count; cancelled ones are ignored entirely
-#   - fee per transaction = floor(amount * fee_bp / 10000)   (KRW, sub-won truncated)
+#   - fee per transaction = floor(amount * fee_bp / 10000), integer arithmetic
+#     only (KRW; the sub-won remainder is truncated)
 #   - daily fee = sum of per-transaction fees (never a fee on the daily total)
 #   - payout = amount - fee
 #   - settlement date = transaction date + 2 calendar days
-#   - a period is a calendar month
+#   - a period is a calendar month of the TRANSACTION date (not the settlement
+#     date): a 07-30 transaction settles on 08-01 but belongs to 2026-07
+#   - the list of periods is the set of months present in the data
+#
+# Statement CSV format (byte-exact; compared by golden/statements.sha256):
+#   - UTF-8, LF line endings, no BOM, no quoting
+#   - header: date,settlement_date,transactions,amount,fee,payout
+#   - one row per day with at least one approved transaction, ascending by date
+#   - final row: TOTAL,,<transactions>,<amount>,<fee>,<payout>
+#   - a period with no approved transactions is the header plus TOTAL,,0,0,0,0
 # ---------------------------------------------------------------------------
 
 sub load_figures {
@@ -162,7 +176,7 @@ sub load_figures {
     for my $t (@$txs) {
         next unless $t->{status} eq 'approved';
         my $m   = $by_id{ $t->{merchant_id} } or die "unknown merchant $t->{merchant_id}\n";
-        my $fee = int($t->{amount} * $m->{fee_bp} / 10000);
+        my $fee = fee_for($t->{amount}, $m->{fee_bp});
         my $day = $daily{ $t->{merchant_id} }{ $t->{date} } //= { transactions => 0, amount => 0, fee => 0 };
         $day->{transactions}++;
         $day->{amount} += $t->{amount};
@@ -193,6 +207,14 @@ sub load_figures {
         periods   => \@periods_sorted,
         daily     => \%periods,    # merchant_id -> period -> [days]
     };
+}
+
+# Integer division throughout. amount >= 0 and fee_bp >= 0, so truncation
+# equals floor. No floating point is involved at any step.
+sub fee_for {
+    my ($amount, $fee_bp) = @_;
+    use integer;
+    return $amount * $fee_bp / 10000;
 }
 
 sub summarize {
@@ -368,6 +390,9 @@ sub cmd_serve {
     open my $log, '>>', "$LOGS/access.log" or die "cannot open access log: $!\n";
     $log->autoflush(1);
 
+    # A client that disconnects mid-response must not take the server with it.
+    $SIG{PIPE} = 'IGNORE';
+
     my $server = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => $port, Listen => 16, ReuseAddr => 1)
         or die "cannot listen on $port: $!\n";
     print "serving $OUT on http://127.0.0.1:$port/\n";
@@ -375,26 +400,46 @@ sub cmd_serve {
     while (my $client = $server->accept) {
         my ($status, $bytes, $request) = handle_request($client);
         printf $log qq{%s - - [%s] "%s" %d %d\n},
-            $client->peerhost // '-', strftime('%d/%b/%Y:%H:%M:%S +0000', gmtime), $request, $status, $bytes;
+            $client->peerhost // '-', strftime('%d/%b/%Y:%H:%M:%S +0000', gmtime), log_escape($request), $status, $bytes;
         close $client;
     }
 }
 
+# The server handles one connection at a time. A client that never finishes
+# its request headers would block everyone else, so reading is capped at
+# $READ_TIMEOUT seconds; such a client gets a 408 and is dropped.
+my $READ_TIMEOUT = 5;
+
 sub handle_request {
     my ($client) = @_;
-    my $request = <$client> // '';
+    my $request = '';
+    my $complete = eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm $READ_TIMEOUT;
+        $request = <$client> // '';
+        while (my $h = <$client>) { last if $h =~ /^\r?\n\z/ }
+        alarm 0;
+        1;
+    };
+    alarm 0;
     $request =~ s/\r?\n\z//;
-    while (my $h = <$client>) { last if $h =~ /^\r?\n\z/ }
+    return respond($client, 408, 'text/plain', "request timeout\n", $request) unless $complete;
 
     my ($method, $target) = $request =~ m{^(\S+) (\S+) HTTP/1\.[01]$};
     return respond($client, 400, 'text/plain', "bad request\n", $request) unless $method;
     return respond($client, 405, 'text/plain', "GET only\n", $request) unless $method eq 'GET';
 
     (my $path = $target) =~ s/\?.*//;
-    return respond($client, 404, 'text/plain', "not found\n", $request) if $path =~ /\.\./;
+    # Only canonical paths are served: a leading slash, then segments made of
+    # [A-Za-z0-9_.-] that are neither empty nor dot-only. This rejects `..`,
+    # `//`, `/./` and anything that could resolve outside out/, and guarantees
+    # that every successful CSV download has exactly one spelling in the log.
+    return respond($client, 404, 'text/plain', "not found\n", $request)
+        unless $path =~ m{\A(?:/(?!\.+(?:/|\z))[\w.-]+)*/?\z};
+    return respond($client, 301, 'text/plain', "moved\n", $request, Location => "$path/")
+        if $path !~ m{/\z} && -d $OUT . $path;
     $path .= 'index.html' if $path =~ m{/\z};
     my $file = $OUT . $path;
-    $file .= '/index.html' if -d $file;
     return respond($client, 404, 'text/plain', "not found\n", $request) unless -f $file;
 
     my ($ext) = $file =~ /\.(\w+)\z/;
@@ -407,7 +452,8 @@ sub handle_request {
 
 sub respond {
     my ($client, $status, $type, $body, $request, %headers) = @_;
-    my %reason = (200 => 'OK', 400 => 'Bad Request', 404 => 'Not Found', 405 => 'Method Not Allowed');
+    my %reason = (200 => 'OK', 301 => 'Moved Permanently', 400 => 'Bad Request', 404 => 'Not Found',
+                  405 => 'Method Not Allowed', 408 => 'Request Timeout');
     my $head = "HTTP/1.0 $status $reason{$status}\r\nContent-Type: $type\r\nContent-Length: " . length($body) . "\r\n";
     $head .= "$_: $headers{$_}\r\n" for sort keys %headers;
     print $client $head, "Connection: close\r\n\r\n", $body;
@@ -416,6 +462,10 @@ sub respond {
 
 # ---------------------------------------------------------------------------
 # golden / verify — the contract every later chapter must honour (README P-5)
+#
+# verify checks the golden files and the built statement CSVs. The API JSON and
+# HTML (FR-5, FR-1/2 presentation) are derived from the same figures but are not
+# compared byte-for-byte; later chapters are held to the summary and statements.
 # ---------------------------------------------------------------------------
 
 sub golden_lines {
@@ -471,10 +521,10 @@ sub cmd_verify {
 sub parse_options {
     my %opt;
     while (my $arg = shift) {
-        die "unknown option $arg\n" unless $arg =~ /^--(seed|port)$/;
+        my ($name) = $arg =~ /^--(seed|port)$/ or die "unknown option $arg\n";
         my $value = shift // die "missing value for $arg\n";
         die "$arg must be a positive integer\n" unless $value =~ /^\d+$/ && $value > 0;
-        $opt{$1} = $value;
+        $opt{$name} = $value;
     }
     return %opt;
 }
@@ -490,6 +540,15 @@ sub add_days {
     my ($date, $n) = @_;
     my ($y, $m, $d) = $date =~ /^(\d{4})-(\d{2})-(\d{2})$/ or die "bad date $date\n";
     return strftime('%Y-%m-%d', gmtime(timegm(0, 0, 12, $d, $m - 1, $y) + $n * 86400));
+}
+
+# The request line is client-controlled. Escape quotes, backslashes and control
+# characters so that a crafted request cannot forge a log line that the button
+# counter would read as a successful download.
+sub log_escape {
+    my ($s) = @_;
+    $s =~ s/([\x00-\x1f\x7f"\\])/sprintf('\\x%02x', ord $1)/ge;
+    return $s;
 }
 
 sub commify {

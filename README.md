@@ -9,7 +9,7 @@
 | Version | 0.1.0-draft |
 | Status | Pre-Alignment |
 | Owner | Office of the Chief Button Officer |
-| Executive Sponsor | <a href="https://www.youtube.com/watch?v=xE9W9Ghe4Jk"><img src="docs/assets/stakeholders/ceo.png" width="48" height="48" alt="Executive Sponsor"></a> Initiated the programme after reading a tweet |
+| Executive Sponsor | <a href="https://www.youtube.com/watch?v=xE9W9Ghe4Jk&t=524s"><img src="docs/assets/stakeholders/ceo.png" width="48" height="48" alt="Executive Sponsor"></a> Initiated the programme after reading a tweet |
 | Review cadence | Whenever someone has an opinion |
 | Supersedes | A two-day estimate |
 

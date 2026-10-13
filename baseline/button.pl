@@ -146,9 +146,11 @@ sub cmd_generate {
 #
 # Rules (shared by every chapter):
 #   - input is data/merchants.csv and data/transactions.csv, as pinned by
-#     golden/data.sha256. Later chapters consume these files; they need not
-#     reimplement the generator. (The `time` and `method` columns are carried
-#     but do not affect any figure.)
+#     golden/data.sha256. The files are not committed; every chapter obtains
+#     them the same way: `perl baseline/button.pl generate` (default seed,
+#     core Perl only), then check them against golden/data.sha256. Later
+#     chapters consume these files; they need not reimplement the generator.
+#     (The `time` and `method` columns are carried but affect no figure.)
 #   - only approved transactions count; cancelled ones are ignored entirely
 #   - fee per transaction = floor(amount * fee_bp / 10000), integer arithmetic
 #     only (KRW; the sub-won remainder is truncated)
@@ -254,7 +256,7 @@ sub cmd_build {
     for my $m (@{ $f->{merchants} }) {
         my $mid = $m->{merchant_id};
         make_path("$OUT/m/$mid", "$OUT/api/m/$mid");
-        write_file("$OUT/m/$mid/index.html", page_redirect("$f->{periods}[-1].html"));
+        write_file("$OUT/m/$mid/index.html", page_redirect(@{ $f->{periods} } ? "$f->{periods}[-1].html" : '../../'));
         for my $p (@{ $f->{periods} }) {
             my $days = $f->{daily}{$mid}{$p} // [];
             my $summary = summarize($days);
@@ -269,9 +271,13 @@ sub cmd_build {
         scalar @{ $f->{merchants} }, scalar @{ $f->{periods} }, $counter->{total};
 }
 
-# FR-4. A press is a successful GET of a statement CSV, as recorded in the
-# access log (Common Log Format). Counting happens at build time, so the panel
-# is at most one cron interval stale.
+# FR-4. A press is a GET of a statement CSV whose 200 response was handed to
+# the operating system in full without error, as recorded in the access log
+# (Common Log Format). If writing or closing the socket fails — the client had
+# already disconnected — the line is logged as 499 and is not a press. A client
+# that disconnects after the OS has accepted the bytes cannot be detected and is
+# counted; that is the limit of what a server can know. Counting happens at
+# build time, so the panel is at most one cron interval stale.
 sub count_button_presses {
     my %c = (total => 0, by_merchant => {});
     open my $fh, '<', "$LOGS/access.log" or return \%c;
@@ -336,13 +342,15 @@ HTML
 }
 
 sub page_redirect {
-    my ($target) = @_;
+    my $target = esc($_[0]);
     return qq{<!DOCTYPE html>\n<meta charset="utf-8">\n<meta http-equiv="refresh" content="0; url=$target">\n<a href="$target">Continue</a>\n};
 }
 
 sub page_period {
     my ($f, $m, $period, $days, $s, $counter, $built_at) = @_;
     my $mid = $m->{merchant_id};
+    # Identifiers are pattern-checked upstream; escaped anyway for consistency.
+    my ($mid_html, $period_html) = (esc($mid), esc($period));
     my $nav = join '', map {
         $_ eq $period ? "<strong>$_</strong> " : qq{<a href="$_.html">$_</a>}
     } @{ $f->{periods} };
@@ -353,7 +361,7 @@ sub page_period {
     my $mine = $counter->{by_merchant}{$mid} // 0;
     return html_doc("$m->{merchant_name} — Settlement $period", <<"HTML");
 <h1>${\ esc($m->{merchant_name})}</h1>
-<p class="crumb">${\ esc($m->{distributor_name})} &rsaquo; ${\ esc($m->{agency_name})} &rsaquo; $mid &middot; fee rate ${\ bp_percent($m->{fee_bp})}%</p>
+<p class="crumb">${\ esc($m->{distributor_name})} &rsaquo; ${\ esc($m->{agency_name})} &rsaquo; $mid_html &middot; fee rate ${\ bp_percent($m->{fee_bp})}%</p>
 <nav>Period: $nav &middot; <a href="../../">all merchants</a></nav>
 
 <h2>Settlement summary — $period</h2>
@@ -362,7 +370,7 @@ sub page_period {
 <tr><td class="n">${\ commify($s->{transactions})}</td><td class="n">${\ commify($s->{amount})}</td><td class="n">${\ commify($s->{fee})}</td><td class="n">${\ commify($s->{payout})}</td></tr>
 </table>
 
-<p><a class="button" href="$period.csv" download="acme-statement-$mid-$period.csv">Download settlement statement (CSV)</a></p>
+<p><a class="button" href="$period_html.csv" download="acme-statement-$mid_html-$period_html.csv">Download settlement statement (CSV)</a></p>
 
 <div class="counter">This button has been pressed <strong>${\ commify($mine)}</strong> times for this merchant,
 <strong>${\ commify($counter->{total})}</strong> times in total. <small>(Counted from the access log at $built_at.)</small></div>
@@ -399,10 +407,10 @@ sub cmd_serve {
     print "serving $OUT on http://127.0.0.1:$port/\n";
 
     while (my $client = $server->accept) {
-        my ($status, $bytes, $request) = handle_request($client);
+        my $peer = $client->peerhost // '-';
+        my ($status, $bytes, $request) = handle_request($client);    # closes $client
         printf $log qq{%s - - [%s] "%s" %d %d\n},
-            $client->peerhost // '-', clf_time(), log_escape($request), $status, $bytes;
-        close $client;
+            $peer, clf_time(), log_escape($request), $status, $bytes;
     }
 }
 
@@ -472,8 +480,11 @@ sub respond {
                   405 => 'Method Not Allowed', 408 => 'Request Timeout');
     my $head = "HTTP/1.0 $status $reason{$status}\r\nContent-Type: $type\r\nContent-Length: " . length($body) . "\r\n";
     $head .= "$_: $headers{$_}\r\n" for sort keys %headers;
-    print $client $head, "Connection: close\r\n\r\n", $body;
-    return ($status, length $body, $request);
+    my $delivered = print $client $head, "Connection: close\r\n\r\n", $body;
+    $delivered = close($client) && $delivered;
+    # If the OS refused the response (the client had already gone), log the
+    # nginx-style 499 with 0 bytes so the FR-4 counter does not count it.
+    return $delivered ? ($status, length $body, $request) : (499, 0, $request);
 }
 
 # ---------------------------------------------------------------------------
@@ -526,6 +537,13 @@ sub cmd_verify {
         print "built file differs or missing: out/$rel\n";
         $failed++;
     }
+    my %expected = map { /  (\S+)$/ ? ($1 => 1) : () } split /\n/, $files{'statements.sha256'};
+    for my $csv (sort glob "$OUT/m/*/*.csv") {
+        (my $rel = $csv) =~ s{^\Q$OUT\E/}{};
+        next if $expected{$rel};
+        print "unexpected file in out/: $rel\n";
+        $failed++;
+    }
     die "verify failed ($failed)\n" if $failed;
     print "verify ok\n";
 }
@@ -547,7 +565,8 @@ sub parse_options {
         die "missing value for $arg\n" unless @args;
         my $value = shift @args;
         die "$arg must be a positive integer\n" unless $value =~ /^\d+$/ && $value > 0;
-        die "$arg must be at most 65535\n" if $name eq 'port' && $value > 65535;
+        die "$arg must be at most 65535\n"      if $name eq 'port' && $value > 65535;
+        die "$arg must be at most 2147483646\n" if $name eq 'seed' && $value > 2147483646;
         $opt{$name} = $value;
     }
     return %opt;

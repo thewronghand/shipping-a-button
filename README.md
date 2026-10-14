@@ -219,7 +219,7 @@ Chapters are delivered sequentially; each builds on the last. Each chapter is ti
 
 | Ch | Title | Stakeholders | Status | Report |
 |---|---|---|---|---|
-| 0 | Baseline | S-07 | ✅ Shipped (frozen) | — |
+| 0 | Baseline | S-07 | ✅ Shipped (frozen) | [PDR-000](docs/chapters/00-baseline.md) |
 | 1 | Architecture | S-01 | Not started | — |
 | 2 | Stack & Runtime | S-02 | Not started | — |
 | 3 | Maintenance | S-03, S-04 | Not started | — |
@@ -244,13 +244,13 @@ Measured after every chapter, against Chapter 0, on the same machine with the sa
 | Lines of code | 724 (513 excl. blanks and comments) | | | | | | | | | |
 | Languages | 1 (Perl) | | | | | | | | | |
 | Dependencies (direct / transitive) | 0 / 0 | | | | | | | | | |
-| Build time (cold / warm) | pending¹ | | | | | | | | | |
+| Build time (cold / warm) | 0.48 s / 0.24 s¹ | | | | | | | | | |
 | Memory, full stack running | 13 MB | | | | | | | | | |
-| Button → CSV latency (p50 / p95) | pending¹ | | | | | | | | | |
+| Button → CSV latency (p50 / p95) | 0.33 ms / 0.41 ms¹ | | | | | | | | | |
 | Processes / containers | 1 / 0 | | | | | | | | | |
 | Configuration lines (of which YAML) | 1 (0) | | | | | | | | | |
 
-¹ Deferred. At the time of measurement the host was running unrelated workloads (load average ≈ 40 on 10 cores). Timings taken under contention would flatter later chapters, so they will be taken on an idle machine and entered here.
+¹ Medians: cold = `generate` + `build` from an empty tree (7 runs), warm = `build` alone (11 runs), latency = 500 sequential downloads after 30 warm-up requests, all on a 10-core Apple Silicon laptop. A first attempt was discarded because unrelated workloads had pushed the load average to about 40; timings taken under contention would have flattered later chapters. These were taken with no process using more than 35% of a core.
 
 Chapter 0 notes:
 - *Time until the button worked* is the interval from branch creation to the first successful CSV download. The baseline then went through **seven rounds of independent review** before it was frozen. The first six each found a real defect, and fixing them turned up more. Among them: CLI options that were silently ignored, case-insensitive routing on macOS, aborted downloads counted as presses, and a log-truncation bug that silently stopped counting long requests. One Perl script and a cron job is less simple than it sounds once its numbers have to be trusted.
